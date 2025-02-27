@@ -1,129 +1,85 @@
-import nltk
-import spacy
-import cv2
-import os
+import ollama
 import requests
+import cv2
 import numpy as np
-from nltk.tokenize import word_tokenize
-from nltk.corpus import stopwords
-from nltk.stem import WordNetLemmatizer
-from nltk.tag import pos_tag
-from PIL import Image
-import io
+import time
+from pydantic import BaseModel
+import re
 
-# Download necessary NLTK resources
-nltk.download("punkt")
-nltk.download("averaged_perceptron_tagger")
-nltk.download("wordnet")
-nltk.download("stopwords")
+# Google API Credentials (Replace these with your credentials)
+GOOGLE_API_KEY = "YOUR_GOOGLE_API_KEY"
+SEARCH_ENGINE_ID = "YOUR_SEARCH_ENGINE_ID"
+GOOGLE_SEARCH_URL = "https://www.googleapis.com/customsearch/v1"
 
-# Initialize NLP components
-lemmatizer = WordNetLemmatizer()
-stop_words = set(stopwords.words("english"))
-nlp = spacy.load("en_core_web_sm")
+# Function to extract technical words using Llama 3.1
+def extract_technical_terms(text):
+    prompt = f"Extract all technical words from the following text:\n\n{text}\n\nOnly return the list of words."
+    response = ollama.chat(model="llama3.1", messages=[{"role": "user", "content": prompt}])
+    
+    # Extract response content
+    technical_words = response['message']['content'].split("\n")  
 
-# Path to video assets
-VIDEO_FOLDER = "assets"
-DEFAULT_VIDEO = os.path.join(VIDEO_FOLDER, "hello.mp4")  # Default fallback video
+    # Clean extracted words (remove bullet points or unwanted characters)
+    cleaned_words = [re.sub(r"[^\w\s]", "", word).strip() for word in technical_words if word.strip()]
+    
+    return cleaned_words
 
-# Bing Image Search API Key (Replace with your key)
-BING_API_KEY = "YOUR_BING_API_KEY"
-BING_SEARCH_URL = "https://api.bing.microsoft.com/v7.0/images/search"
+# Pydantic model for validating image search input
+class ImageSearchInput(BaseModel):
+    query: str
 
+# Function to fetch an image using Google Custom Search API
+def fetch_image(query: str) -> str:
+    validated_input = ImageSearchInput(query=query)  # Validate input using Pydantic
 
-def process_text(sentence):
-    """Tokenize, lemmatize, and remove stopwords from the input sentence."""
-    sentence = sentence.lower()
-    words = word_tokenize(sentence)
-    words = [w for w in words if w.isalnum()]  # Remove punctuation
+    params = {
+        "key": GOOGLE_API_KEY,
+        "cx": SEARCH_ENGINE_ID,
+        "q": validated_input.query,
+        "searchType": "image",
+        "num": 1  # Get only one image
+    }
+    response = requests.get(GOOGLE_SEARCH_URL, params=params)
 
-    # POS tagging
-    tagged = pos_tag(words)
-
-    # Lemmatization and stopword filtering
-    processed_words = []
-    for word, tag in tagged:
-        pos = "n"  # Default to noun
-        if tag.startswith("V"):
-            pos = "v"  # Verb
-        elif tag.startswith("J"):
-            pos = "a"
-
-        lemmatized_word = lemmatizer.lemmatize(word, pos)
-
-        # Keep important words
-        if word not in stop_words or word in ["is", "are", "was", "were", "be", "to", "i", "you", "we", "he", "she", "they", "will"]:
-            processed_words.append(lemmatized_word)
-
-    doc = nlp(" ".join(processed_words))
-    final_sentence = " ".join([token.text for token in doc])
-
-    return final_sentence.split()  # Return list of processed words
-
-
-def fetch_image_for_word(word):
-    """Fetch an image using Bing Image Search API."""
-    headers = {"Ocp-Apim-Subscription-Key": BING_API_KEY}
-    params = {"q": word, "count": 1, "imageType": "photo"}
-
-    response = requests.get(BING_SEARCH_URL, headers=headers, params=params)
-    response.raise_for_status()
-    results = response.json()
-
-    if "value" in results and len(results["value"]) > 0:
-        return results["value"][0]["contentUrl"]
-    return None
-
-
-def play_videos_for_sentence(words):
-    """Plays videos for words or fetches images if videos are missing."""
-    cv2.namedWindow("Video Player", cv2.WINDOW_NORMAL)
-
-    for word in words:
-        video_path = os.path.join(VIDEO_FOLDER, f"{word}.mp4")
-
-        # If video exists, play it
-        if os.path.exists(video_path):
-            cap = cv2.VideoCapture(video_path)
-            if not cap.isOpened():
-                print(f"Error: Cannot open video file {video_path}")
-                continue
-
-            while cap.isOpened():
-                ret, frame = cap.read()
-                if not ret:
-                    break  # Stop when the video ends
-
-                cv2.imshow("Video Player", frame)
-                if cv2.waitKey(25) & 0xFF == ord("q"):  # Press 'q' to exit early
-                    cap.release()
-                    cv2.destroyAllWindows()
-                    return
-            cap.release()
-        
+    if response.status_code == 200:
+        data = response.json()
+        if "items" in data and data["items"]:
+            return data["items"][0]["link"]  # Return the image URL
         else:
-            print(f"Video not found for '{word}', fetching an image instead.")
+            print(f"No image found for {query}")
+            return None
+    else:
+        print(f"Failed to fetch image for {query}. Status Code: {response.status_code}")
+        return None
 
-            # Fetch image from Bing Image Search
-            image_url = fetch_image_for_word(word)
-            if image_url:
-                response = requests.get(image_url)
-                image = Image.open(io.BytesIO(response.content))
-                img_np = np.array(image)
-                img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+# Function to display images using OpenCV
+def display_images(technical_words):
+    for word in technical_words:
+        print(f"Fetching image for: {word}")
+        image_url = fetch_image(word)  # Fetch image URL
+        time.sleep(1)  # Prevent API rate limiting
+        
+        if not image_url:
+            print(f"No image found for {word}")
+            continue
 
-                cv2.imshow("Video Player", img_np)
-                cv2.waitKey(2000)  # Show image for 2 seconds
+        # Fetch and display the image
+        response = requests.get(image_url)
+        if response.status_code == 200:
+            image_array = np.asarray(bytearray(response.content), dtype=np.uint8)
+            image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+
+            if image is not None:
+                cv2.imshow(word, image)
+                cv2.waitKey(2000)  # Show each image for 2 seconds
+                cv2.destroyAllWindows()
             else:
-                print(f"No image found for '{word}', skipping...")
-
-    cv2.destroyAllWindows()
-
+                print(f"Failed to decode image for {word}")
+        else:
+            print(f"Failed to fetch image for {word}")
 
 # Example usage
-if __name__ == "__main__":
-    sentence = input("Enter a sentence: ")
-    words = process_text(sentence)
-    print("Processed Words:", words)
-
-    play_videos_for_sentence(words)
+text = "The model utilizes transformers, attention mechanisms, and embeddings to process NLP tasks efficiently."
+technical_words = extract_technical_terms(text)
+print("Extracted Technical Words:", technical_words)
+display_images(technical_words)
